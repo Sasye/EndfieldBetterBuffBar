@@ -1,4 +1,4 @@
-﻿#define APPLEPIE_PLUGIN_IMPL
+#define APPLEPIE_PLUGIN_IMPL
 #include "applepie_mgr.h"
 #include "MinHook.h"
 #include <cstdint>
@@ -9,6 +9,10 @@
 
 extern "C" __declspec(dllexport) void DummyExport() {}
 static volatile bool g_pluginActive = true;
+static volatile bool g_langZh = true; // true=Chinese, false=English; toggled by AP_SetLanguage
+
+// Language selector: picks Chinese or English string at zero cost
+#define L(zh, en) (g_langZh ? (zh) : (en))
 
 static HANDLE g_logHandle = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_logLock;
@@ -576,7 +580,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         // Format duration string
       char durStr[128];
       if (ab.duration >= 100000.0f) {
-        snprintf(durStr, sizeof(durStr), "\xe6\xb0\xb8\xe4\xb9\x85"); // yong jiu
+        snprintf(durStr, sizeof(durStr), "%s", L("\xe6\xb0\xb8\xe4\xb9\x85", "Permanent")); // 永久
       } else if (ab.lifeTime > 0.0f) {
         snprintf(durStr, sizeof(durStr), "%.1fs / %.1fs", ab.lifeTime, ab.duration);
       } else {
@@ -623,7 +627,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       if (!friendlyName[0]) {
         for (auto &in : iconNames) {
           if (ab.iconName[0] && strstr(ab.iconName, in.pat)) {
-            strncpy(friendlyName, in.name, 127);
+            strncpy(friendlyName, g_langZh ? in.name : in.pat, 127);
             break;
           }
         }
@@ -632,7 +636,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       if (!friendlyName[0]) {
         for (auto &in : iconNames) {
           if (strstr(ab.id, in.pat)) {
-            strncpy(friendlyName, in.name, 127);
+            strncpy(friendlyName, g_langZh ? in.name : in.pat, 127);
             break;
           }
         }
@@ -644,11 +648,13 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 
       snprintf(g_tooltipText, sizeof(g_tooltipText),
                "%s%s%s\n"
-               "\xe6\x97\xb6\xe9\x97\xb4: %s\n"
-               "\xe5\xb1\x82\xe6\x95\xb0: %d\n",
+               "%s: %s\n"
+               "%s: %d\n",
                friendlyName[0] ? friendlyName : "",
                friendlyName[0] ? " | " : "",
-               ab.id, durStr, ab.enhanceCnt);
+               ab.id,
+               L("\xe6\x97\xb6\xe9\x97\xb4", "Time"), durStr,
+               L("\xe5\xb1\x82\xe6\x95\xb0", "Stack"), ab.enhanceCnt);
 
       bool logOnce = (ab.instUid != s_lastLogUid || ab.enhanceCnt != s_lastLogEnhance);
       if (logOnce) {
@@ -730,15 +736,15 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         int at = j;  // array index IS the AttributeType directly
         // 8 modifier zones per 数据导论 2.2
         // Base phase (基础阶段)
-        SHOW_ADD(baseAdd,      "\xe5\x9f\xba\xe7\xa1\x80\xe5\x8a\xa0\xe7\xae\x97")       // 基础加算
-        SHOW_PCT(baseMul,      "\xe5\x9f\xba\xe7\xa1\x80\xe7\x99\xbe\xe5\x88\x86\xe6\xaf\x94") // 基础百分比
-        SHOW_ADD(baseFinalAdd, "\xe5\x9f\xba\xe7\xa1\x80\xe6\x9c\x80\xe7\xbb\x88\xe5\x8a\xa0\xe7\xae\x97") // 基础最终加算
-        SHOW_SCL(baseFinalScl, "\xe5\x9f\xba\xe7\xa1\x80\xe6\x9c\x80\xe7\xbb\x88\xe5\x80\x8d\xe7\x8e\x87") // 基础最终倍率
+        SHOW_ADD(baseAdd,      L("\xe5\x9f\xba\xe7\xa1\x80\xe5\x8a\xa0\xe7\xae\x97", "Base Add"))           // 基础加算
+        SHOW_PCT(baseMul,      L("\xe5\x9f\xba\xe7\xa1\x80\xe7\x99\xbe\xe5\x88\x86\xe6\xaf\x94", "Base Pct"))  // 基础百分比
+        SHOW_ADD(baseFinalAdd, L("\xe5\x9f\xba\xe7\xa1\x80\xe6\x9c\x80\xe7\xbb\x88\xe5\x8a\xa0\xe7\xae\x97", "Base Final Add"))  // 基础最终加算
+        SHOW_SCL(baseFinalScl, L("\xe5\x9f\xba\xe7\xa1\x80\xe6\x9c\x80\xe7\xbb\x88\xe5\x80\x8d\xe7\x8e\x87", "Base Final Mult")) // 基础最终倍率
         // Main phase (主修正阶段)
-        SHOW_ADD(add,          "\xe5\x8a\xa0\xe7\xae\x97")       // 加算
-        SHOW_SCL(mul,          "\xe4\xb9\x98\xe7\xae\x97")       // 乘算
-        SHOW_ADD(finalAdd,     "\xe6\x9c\x80\xe7\xbb\x88\xe5\x8a\xa0\xe7\xae\x97") // 最终加算
-        SHOW_SCL(finalScl,     "\xe6\x9c\x80\xe7\xbb\x88\xe5\x80\x8d\xe7\x8e\x87") // 最终倍率
+        SHOW_ADD(add,          L("\xe5\x8a\xa0\xe7\xae\x97", "Addition"))       // 加算
+        SHOW_SCL(mul,          L("\xe4\xb9\x98\xe7\xae\x97", "Multiplier"))     // 乘算
+        SHOW_ADD(finalAdd,     L("\xe6\x9c\x80\xe7\xbb\x88\xe5\x8a\xa0\xe7\xae\x97", "Final Add"))    // 最终加算
+        SHOW_SCL(finalScl,     L("\xe6\x9c\x80\xe7\xbb\x88\xe5\x80\x8d\xe7\x8e\x87", "Final Mult"))   // 最终倍率
       }
 
       #undef SHOW_ADD
@@ -771,9 +777,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 char buf[200];
                 if (s.isDmgTaken) {
                   // rate=0.10 => takes 10% dmg => 90% reduction
+                  const char *dispLabel = g_langZh ? s.label : s.pat;
                   snprintf(buf, sizeof(buf),
-                    " %s: \xe5\x87\x8f\xe4\xbc\xa4%.1f%%\n",
-                    s.label, (1.0 - rateVal) * 100.0);
+                    " %s: %s%.1f%%\n",
+                    dispLabel, L("\xe5\x87\x8f\xe4\xbc\xa4", "DR "), (1.0 - rateVal) * 100.0);
                 }
                 tooltip_cat(buf);
                 handled2 = true;
@@ -830,7 +837,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             for (auto &m : enhMap) {
               if (strstr(src, m.pat)) {
                 char buf[200];
-                snprintf(buf, sizeof(buf), " %s: +%.1f%%\n", m.label, rateVal * 100.0);
+                const char *dispLabel = g_langZh ? m.label : m.pat;
+                snprintf(buf, sizeof(buf), " %s: +%.1f%%\n", dispLabel, rateVal * 100.0);
                 tooltip_cat(buf);
                 handled = true;
                 break;
@@ -842,7 +850,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
           if (!handled) {
             char buf[200];
             snprintf(buf, sizeof(buf),
-              " \xe5\xa2\x9e\xe5\xb9\x85: +%.1f%%\n", rateVal * 100.0);
+              " %s: +%.1f%%\n", L("\xe5\xa2\x9e\xe5\xb9\x85", "Enhance"), rateVal * 100.0);
             tooltip_cat(buf);
             handled = true;
           }
@@ -995,10 +1003,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
           char buf[200];
           for (auto &km : keyMap) {
             if (strcmp(k, km.raw) == 0) {
+              const char *dispLabel = g_langZh ? km.label : km.raw;
               if (km.isPct)
-                snprintf(buf, sizeof(buf), " %s: %+.1f%%\n", km.label, v * 100.0);
+                snprintf(buf, sizeof(buf), " %s: %+.1f%%\n", dispLabel, v * 100.0);
               else
-                snprintf(buf, sizeof(buf), " %s: %+.1f\n", km.label, v);
+                snprintf(buf, sizeof(buf), " %s: %+.1f\n", dispLabel, v);
               tooltip_cat(buf);
               found = true;
               break;
@@ -2009,13 +2018,18 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
 static AP_PluginInfo s_pluginInfo = {
     APPLEPIE_PLUGIN_API_VERSION,
     "combat_hud",
-    "Combat HUD",
-    "Display buff details and attribute bonuses",
+    "Combat HUD \xe6\x88\x98\xe6\x96\x97\xe4\xbf\xa1\xe6\x81\xaf",        // 战斗信息
+    "\xe6\x98\xbe\xe7\xa4\xba" "Buff\xe8\xaf\xa6\xe6\x83\x85\xe4\xb8\x8e\xe5\xb1\x9e\xe6\x80\xa7\xe5\x8a\xa0\xe6\x88\x90",  // 显示Buff详情与属性加成
     nullptr,
     true  // supports hot disable
 };
 
 APPLEPIE_PLUGIN_EXPORT AP_PluginInfo* AP_GetPluginInfo() {
+    // Update language-dependent strings
+    s_pluginInfo.displayName = L("Combat HUD \xe6\x88\x98\xe6\x96\x97\xe4\xbf\xa1\xe6\x81\xaf",
+                                  "Combat HUD");
+    s_pluginInfo.description = L("\xe6\x98\xbe\xe7\xa4\xba" "Buff\xe8\xaf\xa6\xe6\x83\x85\xe4\xb8\x8e\xe5\xb1\x9e\xe6\x80\xa7\xe5\x8a\xa0\xe6\x88\x90",
+                                  "Display buff details and attribute bonuses");
     return &s_pluginInfo;
 }
 
@@ -2027,4 +2041,11 @@ APPLEPIE_PLUGIN_EXPORT bool AP_PluginEnable() {
 APPLEPIE_PLUGIN_EXPORT bool AP_PluginDisable() {
     g_pluginActive = false;
     return true;
+}
+
+APPLEPIE_PLUGIN_EXPORT void AP_SetLanguage(const char* langCode) {
+    bool wasZh = g_langZh;
+    g_langZh = (langCode && langCode[0] == 'z');
+    if (wasZh != g_langZh)
+        Log("[LANG] Language switched to: %s", g_langZh ? "zh" : "en");
 }
