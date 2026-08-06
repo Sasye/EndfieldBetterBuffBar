@@ -4,6 +4,8 @@ English | [中文](README.md)
 
 Enhances the combat HUD in *Arknights: Endfield* with a detailed buff/debuff inspection feature and real-time combat information display. Hovering over a buff icon in the status bar will display a detailed attribute panel that reveals the exact duration, stack count, and precise attribute modifiers (e.g., +10.0% ATK, +9.0% Spell Enhance, etc.). During combat, a bracket-shaped HUD flanking the crosshair shows Combo Skill cooldowns and Ultimate charge progress.
 
+> Use [Applepie Manager](https://github.com/Sasye/ApplepieManager) to conveniently manage and configure this plugin.
+
 ## User Agreement & Disclaimer
 
 <details>
