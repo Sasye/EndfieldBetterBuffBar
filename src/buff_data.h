@@ -18,6 +18,16 @@ static void *g_getEnhanceCnt = nullptr;
 static void *g_getAttrAdd = nullptr, *g_getAttrMul = nullptr;
 static size_t g_loaderOffset = 0;
 
+// AttributeModifierLoader field offsets (resolved dynamically, defaults = old hardcoded values)
+static int g_offAmlAdd = 0x18;           // m_addition
+static int g_offAmlMul = 0x10;           // m_multiplier
+static int g_offAmlFinalAdd = 0x20;      // m_finalAddition
+static int g_offAmlFinalScl = 0x28;      // m_finalMultiplier
+static int g_offAmlBaseAdd = 0x38;       // m_baseAddition
+static int g_offAmlBaseMul = 0x30;       // m_baseMultiplier
+static int g_offAmlBaseFinalAdd = 0x40;  // m_baseFinalAddition
+static int g_offAmlBaseFinalScl = 0x48;  // m_baseFinalMultiplier
+
 // Index mapping for s_attributesToModify
 static int32_t g_satmMap[96] = {0};
 static int g_satmLen = 0;

@@ -274,7 +274,11 @@
 
 // --- Payload ---
 void LoadPlugin() {
-    // Auto-load all DLLs from 'plugin' subdirectory
+    // Try loading plugin manager first — it will handle loading other plugins
+    HMODULE hMgr = LoadLibraryA("plugin\\applepie_manager.dll");
+    if (hMgr) return; // Manager takes over plugin loading
+
+    // Fallback: no manager found, load all DLLs directly (backward compatible)
     WIN32_FIND_DATAA fd;
     HANDLE hFind = FindFirstFileA("plugin\\*.dll", &fd);
     if (hFind != INVALID_HANDLE_VALUE) {

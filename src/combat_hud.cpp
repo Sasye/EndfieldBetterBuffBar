@@ -1,3 +1,5 @@
+﻿#define APPLEPIE_PLUGIN_IMPL
+#include "applepie_mgr.h"
 #include "MinHook.h"
 #include <cstdint>
 #include <cstring>
@@ -6,6 +8,7 @@
 #include <windows.h>
 
 extern "C" __declspec(dllexport) void DummyExport() {}
+static volatile bool g_pluginActive = true;
 
 static HANDLE g_logHandle = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_logLock;
@@ -60,6 +63,8 @@ static void tooltip_cat(const char *src) {
 // Overlay Window (runs on its own thread - no interference with game)
 // ============================================================================
 static void DrawTooltip(HDC hdc) {
+  if (!g_pluginActive)
+    return;
   if (!g_showTooltip || g_tooltipText[0] == '\0')
     return;
 
@@ -373,40 +378,33 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       return 0;
     }
 
-    // Z-order based visibility (throttled to every ~500ms to reduce overhead)
-    // On 4K displays, the per-tick Z-order walk + full-screen bitmap ops are expensive
+    // Visibility: show overlay only when game (or its child window) is foreground
     {
-      static DWORD s_lastZCheckTick = 0;
+      static DWORD s_lastFgCheckTick = 0;
       DWORD now = GetTickCount();
-      if (now - s_lastZCheckTick > 100) {
-        s_lastZCheckTick = now;
-      bool coveredByApp = false;
-      // Walk Z-order from top, looking for a visible non-TOPMOST window above the game
-      HWND w = GetTopWindow(NULL);
-      while (w && w != g_gameHwnd) {
-        if (w != hwnd && IsWindowVisible(w)) {
-          LONG exStyle = GetWindowLongA(w, GWL_EXSTYLE);
-          bool isOverlay = (exStyle & WS_EX_TOPMOST) || (exStyle & WS_EX_TOOLWINDOW);
-          if (!isOverlay) {
-            // A regular visible window is above the game — user alt-tabbed
-            RECT wr;
-            GetWindowRect(w, &wr);
-            int wArea = (wr.right - wr.left) * (wr.bottom - wr.top);
-            if (wArea > 50000) { // ignore tiny windows (notifications, tooltips)
-              coveredByApp = true;
-              break;
-            }
-          }
+      if (now - s_lastFgCheckTick > 100) {
+        s_lastFgCheckTick = now;
+        HWND fg = GetForegroundWindow();
+        bool gameActive = false;
+        if (fg == g_gameHwnd) {
+          gameActive = true;
+        } else if (fg) {
+          // Check if foreground window belongs to same process
+          // (handles in-game overlays, popup dialogs, etc.)
+          DWORD fgPid = 0;
+          GetWindowThreadProcessId(fg, &fgPid);
+          DWORD gamePid = 0;
+          GetWindowThreadProcessId(g_gameHwnd, &gamePid);
+          if (fgPid == gamePid)
+            gameActive = true;
         }
-        w = GetNextWindow(w, GW_HWNDNEXT);
-      }
-      if (coveredByApp) {
-        if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
-        return 0;
-      } else if (!IsWindowVisible(hwnd)) {
-        ShowWindow(hwnd, SW_SHOWNA);
-        g_needRepaint = true;
-      }
+        if (!gameActive) {
+          if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
+          return 0;
+        } else if (!IsWindowVisible(hwnd)) {
+          ShowWindow(hwnd, SW_SHOWNA);
+          g_needRepaint = true;
+        }
       }
     }
 
@@ -530,6 +528,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       }
     }
 
+
+    // Log throttle: only fire once per hover session
+    static uint32_t s_lastLogUid = 0;
+    static int s_lastLogEnhance = -1;
+
     if (newHover && hoveredVisIdx >= 0 && hoveredVisIdx < visibleCount) {
       int bIdx = visibleMap[hoveredVisIdx];
       if (bIdx >= 0 && bIdx < g_buffCount) {
@@ -543,12 +546,12 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
           }
         }
 
-        // Multiply static attributes ONLY when the UI shows more stacks than the engine tracks.
-        // If trueEnhanceCnt == enhanceCnt, the engine already scaled the AttributeModifierLoader
-        // to reflect all stacks (e.g. character buffs). If trueEnhanceCnt < enhanceCnt, the UI
-        // is visually grouping independent instances whose loaders only contain base values.
-        if (ab.trueEnhanceCnt > 0 && ab.enhanceCnt > ab.trueEnhanceCnt) {
-          int multiplier = ab.enhanceCnt / ab.trueEnhanceCnt;
+        // Multiply static attributes by stack count.
+        // The AttributeModifierLoader always stores per-stack base values;
+        // the game engine applies the multiplier internally but our raw
+        // loader read gets only base values.
+        if (ab.enhanceCnt > 1) {
+          int multiplier = ab.enhanceCnt;
           for (int j = 0; j < 96; j++) {
             ab.attrs.add[j] *= multiplier;
             ab.attrs.baseAdd[j] *= multiplier;
@@ -559,14 +562,13 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             ab.attrs.finalScl[j] *= multiplier;
             ab.attrs.baseFinalScl[j] *= multiplier;
           }
-          // Also multiply blackboard values for independent-instance stacking.
-          // Each instance holds its own base value — the engine doesn't merge
-          // blackboard across independent instances.
+          // Also multiply blackboard values.
           // Skip 'duration' and 'rate' keys (those are per-instance constants).
           for (int b = 0; b < ab.bbCount; b++) {
             const char *k = ab.bb[b].key;
             if (strcmp(k, "duration") == 0) continue;
             if (strcmp(k, "rate") == 0) continue;
+            if (strcmp(k, "max_stack") == 0) continue;
             ab.bb[b].value *= multiplier;
           }
         }
@@ -584,33 +586,33 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       const char *displayName = ab.id;
       // Icon-based type name mapping
       struct { const char *pat; const char *name; } iconNames[] = {
-        {"atk_up",          "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b\xe6\x8f\x90\xe5\x8d\x87"},
-        {"def_up",          "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b\xe6\x8f\x90\xe5\x8d\x87"},
-        {"hp_up",           "\xe7\x94\x9f\xe5\x91\xbd\xe5\x80\xbc\xe6\x8f\x90\xe5\x8d\x87"},
-        {"spd_up",          "\xe9\x80\x9f\xe5\xba\xa6\xe6\x8f\x90\xe5\x8d\x87"},
-        {"crit_up",         "\xe6\x9a\xb4\xe5\x87\xbb\xe6\x8f\x90\xe5\x8d\x87"},
-        {"pulse_dmg_up",    "\xe7\x94\xb5\xe7\xa3\x81\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
-        {"fire_dmg_up",     "\xe7\x81\xab\xe7\x84\xb0\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
-        {"cryst_dmg_up",    "\xe5\xaf\x92\xe5\x86\xb7\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
-        {"natural_dmg_up",  "\xe8\x87\xaa\xe7\x84\xb6\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
-        {"ether_dmg_up",    "\xe4\xbb\xa5\xe5\xa4\xaa\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
-        {"physical_dmg_up", "\xe7\x89\xa9\xe7\x90\x86\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
-        {"spell_enhance",   "\xe6\xb3\x95\xe6\x9c\xaf\xe5\xa2\x9e\xe5\xb9\x85"},
-        {"fire_enhance",    "\xe7\x81\xab\xe7\x84\xb0\xe5\xa2\x9e\xe5\xb9\x85"},
-        {"pulse_enhance",   "\xe7\x94\xb5\xe7\xa3\x81\xe5\xa2\x9e\xe5\xb9\x85"},
-        {"cryst_enhance",   "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85"},
-        {"natural_enhance", "\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85"},
-        {"ether_enhance",   "\xe4\xbb\xa5\xe5\xa4\xaa\xe5\xa2\x9e\xe5\xb9\x85"},
-        {"physical_enhance","\xe7\x89\xa9\xe7\x90\x86\xe5\xa2\x9e\xe5\xb9\x85"},
-        {"shelter",         "\xe5\xba\x87\xe6\x8a\xa4"},
-        {"shield",          "\xe6\x8a\xa4\xe7\x9b\xbe"},
-        {"heal",            "\xe6\xb2\xbb\xe7\x96\x97"},
-        {"regen",           "\xe5\x86\x8d\xe7\x94\x9f"},
-        {"atk_down",        "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b\xe9\x99\x8d\xe4\xbd\x8e"},
-        {"def_down",        "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b\xe9\x99\x8d\xe4\xbd\x8e"},
-        {"vuln",            "\xe6\x98\x93\xe4\xbc\xa4"},
-        {"weaken",          "\xe5\xbc\xb1\xe5\x8c\x96"},
-        {"slow",            "\xe5\x87\x8f\xe9\x80\x9f"},
+        {"atk_up",           "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b\xe6\x8f\x90\xe5\x8d\x87"},
+        {"def_up",           "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b\xe6\x8f\x90\xe5\x8d\x87"},
+        {"hp_up",            "\xe7\x94\x9f\xe5\x91\xbd\xe6\x8f\x90\xe5\x8d\x87"},
+        {"spd_up",           "\xe9\x80\x9f\xe5\xba\xa6\xe6\x8f\x90\xe5\x8d\x87"},
+        {"crit_up",          "\xe6\x9a\xb4\xe5\x87\xbb\xe6\x8f\x90\xe5\x8d\x87"},
+        {"pulse_dmg_up",     "\xe7\x94\xb5\xe7\xa3\x81\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
+        {"fire_dmg_up",      "\xe7\x81\xab\xe7\x84\xb0\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
+        {"cryst_dmg_up",     "\xe5\xaf\x92\xe5\x86\xb7\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
+        {"natural_dmg_up",   "\xe8\x87\xaa\xe7\x84\xb6\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
+        {"ether_dmg_up",     "\xe8\xb6\x85\xe5\x9f\x9f\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
+        {"physical_dmg_up",  "\xe7\x89\xa9\xe7\x90\x86\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87"},
+        {"spell_enhance",    "\xe6\xb3\x95\xe6\x9c\xaf\xe5\xa2\x9e\xe5\xb9\x85"},
+        {"fire_enhance",     "\xe7\x81\xab\xe7\x84\xb0\xe5\xa2\x9e\xe5\xb9\x85"},
+        {"pulse_enhance",    "\xe7\x94\xb5\xe7\xa3\x81\xe5\xa2\x9e\xe5\xb9\x85"},
+        {"cryst_enhance",    "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85"},
+        {"natural_enhance",  "\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85"},
+        {"ether_enhance",    "\xe8\xb6\x85\xe5\x9f\x9f\xe5\xa2\x9e\xe5\xb9\x85"},
+        {"physical_enhance", "\xe7\x89\xa9\xe7\x90\x86\xe5\xa2\x9e\xe5\xb9\x85"},
+        {"shelter",          "\xe5\xba\x87\xe6\x8a\xa4"},
+        {"shield",           "\xe6\x8a\xa4\xe7\x9b\xbe"},
+        {"heal",             "\xe6\xb2\xbb\xe7\x96\x97"},
+        {"regen",            "\xe5\x86\x8d\xe7\x94\x9f"},
+        {"atk_down",         "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b\xe4\xb8\x8b\xe9\x99\x8d"},
+        {"def_down",         "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b\xe4\xb8\x8b\xe9\x99\x8d"},
+        {"vuln",             "\xe6\x98\x93\xe4\xbc\xa4"},
+        {"weaken",           "\xe5\xbc\xb1\xe5\x8c\x96"},
+        {"slow",             "\xe5\x87\x8f\xe9\x80\x9f"},
       };
       char friendlyName[128] = {};
       // Priority 1: Extract character name + skill type from buff string ID
@@ -648,43 +650,60 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                friendlyName[0] ? " | " : "",
                ab.id, durStr, ab.enhanceCnt);
 
-      // Helper: determine if AttributeType is a flat value
-      auto isFlatAttr = [](int j) -> bool {
+      bool logOnce = (ab.instUid != s_lastLogUid || ab.enhanceCnt != s_lastLogEnhance);
+      if (logOnce) {
+        s_lastLogUid = ab.instUid;
+        s_lastLogEnhance = ab.enhanceCnt;
+        Log("[HOVER] buff=%s enhance=%d bb=%d", ab.id, ab.enhanceCnt, ab.bbCount);
+        for (int b = 0; b < ab.bbCount; b++)
+          Log("  bb[%d] key='%s' val=%.6f", b, ab.bb[b].key, ab.bb[b].value);
+        for (int j = 0; j < 94; j++) {
+          if (ab.attrs.add[j] != 0) Log("  add[%d]=%f", j, ab.attrs.add[j]);
+          if (ab.attrs.baseAdd[j] != 0) Log("  baseAdd[%d]=%f", j, ab.attrs.baseAdd[j]);
+          if (ab.attrs.finalAdd[j] != 0) Log("  finalAdd[%d]=%f", j, ab.attrs.finalAdd[j]);
+          if (ab.attrs.baseFinalAdd[j] != 0) Log("  baseFinalAdd[%d]=%f", j, ab.attrs.baseFinalAdd[j]);
+          if (ab.attrs.mul[j] != 0) Log("  mul[%d]=%f", j, ab.attrs.mul[j]);
+          if (ab.attrs.baseMul[j] != 0) Log("  baseMul[%d]=%f", j, ab.attrs.baseMul[j]);
+          if (ab.attrs.finalScl[j] != 0) Log("  finalScl[%d]=%f", j, ab.attrs.finalScl[j]);
+          if (ab.attrs.baseFinalScl[j] != 0) Log("  baseFinalScl[%d]=%f", j, ab.attrs.baseFinalScl[j]);
+        }
+      }
+      // Helper: determine if AttributeType is a flat value (absolute number, not percentage)
+      auto isFlatAttr = [](int attrType) -> bool {
+        // AttrTypes that represent absolute values (HP, ATK, DEF, abilities, etc.)
         int flat[] = {0, 1, 2, 3, 8, 11, 12, 15, 18, 20, 21, 22, 34, 39, 40, 41, 42, 45, 46, 90};
         for (int i = 0; i < sizeof(flat)/sizeof(flat[0]); i++) {
-          if (j == flat[i]) return true;
+          if (attrType == flat[i]) return true;
         }
         return false;
       };
 
       // Display each modifier array separately with zone label
-      // Helper: show non-zero additive entries
+      // j = array index, at = AttributeType from SATM mapping
       #define SHOW_ADD(arr, label) \
         if (ab.attrs.arr[j] != 0.0f) { \
           char buf[160]; \
-          if (isFlatAttr(j)) { \
+          if (isFlatAttr(at)) { \
             snprintf(buf, sizeof(buf), " %+.1f %s (%s)\n", \
-                     ab.attrs.arr[j], GetAttrName(j), label); \
+                     ab.attrs.arr[j], GetAttrName(at), label); \
           } else { \
             snprintf(buf, sizeof(buf), " %+.1f%% %s (%s)\n", \
-                     ab.attrs.arr[j] * 100.0f, GetAttrName(j), label); \
+                     ab.attrs.arr[j] * 100.0f, GetAttrName(at), label); \
           } \
           tooltip_cat(buf); \
         }
-      // Helper: show non-zero percentage entries
       #define SHOW_PCT(arr, label) \
         if (ab.attrs.arr[j] != 0.0f) { \
           char buf[160]; \
           snprintf(buf, sizeof(buf), " %+.1f%% %s (%s)\n", \
-                   ab.attrs.arr[j] * 100.0f, GetAttrName(j), label); \
+                   ab.attrs.arr[j] * 100.0f, GetAttrName(at), label); \
           tooltip_cat(buf); \
         }
-      // Helper: show scalar entries that deviate from 1.0
       #define SHOW_SCL(arr, label) \
         if (ab.attrs.arr[j] != 0.0f && ab.attrs.arr[j] != 1.0f) { \
           char buf[160]; \
           snprintf(buf, sizeof(buf), " x%.0f%% %s (%s)\n", \
-                   ab.attrs.arr[j] * 100.0f, GetAttrName(j), label); \
+                   ab.attrs.arr[j] * 100.0f, GetAttrName(at), label); \
           tooltip_cat(buf); \
         }
 
@@ -698,7 +717,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             else if (arr[i] != first) return false;
           }
         }
-        // Uniform if we found 10+ identical non-trivial values
         int cnt = 0;
         if (found) for (int i = 0; i < len; i++) if (arr[i] == first) cnt++;
         return found && cnt >= 10;
@@ -709,15 +727,18 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       if (isUniformScale(ab.attrs.baseMul, 94))      memset(ab.attrs.baseMul, 0, sizeof(ab.attrs.baseMul));
 
       for (int j = 0; j < 94; j++) {
-        // 4 additive arrays - flat values
-        SHOW_ADD(baseAdd,     "\xe5\x9f\xba\xe7\xa1\x80")
-        SHOW_ADD(add,         "\xe5\x9b\xba\xe5\xae\x9a")
-        SHOW_ADD(baseFinalAdd,"\xe5\x9f\xba\xe7\xa1\x80\xe6\x9c\x80\xe7\xbb\x88")
-        SHOW_ADD(finalAdd,    "\xe6\x9c\x80\xe7\xbb\x88")
-        SHOW_PCT(baseMul,     "\xe7\x99\xbe\xe5\x88\x86\xe6\xaf\x94")
-        SHOW_SCL(mul,         "\xe4\xb9\x98\xe5\x8c\xba")
-        SHOW_SCL(finalScl,    "\xe6\x9c\x80\xe7\xbb\x88\xe7\xbc\xa9\xe6\x94\xbe")
-        SHOW_SCL(baseFinalScl,"\xe5\x9f\xba\xe7\xa1\x80\xe7\xbc\xa9\xe6\x94\xbe")
+        int at = j;  // array index IS the AttributeType directly
+        // 8 modifier zones per 数据导论 2.2
+        // Base phase (基础阶段)
+        SHOW_ADD(baseAdd,      "\xe5\x9f\xba\xe7\xa1\x80\xe5\x8a\xa0\xe7\xae\x97")       // 基础加算
+        SHOW_PCT(baseMul,      "\xe5\x9f\xba\xe7\xa1\x80\xe7\x99\xbe\xe5\x88\x86\xe6\xaf\x94") // 基础百分比
+        SHOW_ADD(baseFinalAdd, "\xe5\x9f\xba\xe7\xa1\x80\xe6\x9c\x80\xe7\xbb\x88\xe5\x8a\xa0\xe7\xae\x97") // 基础最终加算
+        SHOW_SCL(baseFinalScl, "\xe5\x9f\xba\xe7\xa1\x80\xe6\x9c\x80\xe7\xbb\x88\xe5\x80\x8d\xe7\x8e\x87") // 基础最终倍率
+        // Main phase (主修正阶段)
+        SHOW_ADD(add,          "\xe5\x8a\xa0\xe7\xae\x97")       // 加算
+        SHOW_SCL(mul,          "\xe4\xb9\x98\xe7\xae\x97")       // 乘算
+        SHOW_ADD(finalAdd,     "\xe6\x9c\x80\xe7\xbb\x88\xe5\x8a\xa0\xe7\xae\x97") // 最终加算
+        SHOW_SCL(finalScl,     "\xe6\x9c\x80\xe7\xbb\x88\xe5\x80\x8d\xe7\x8e\x87") // 最终倍率
       }
 
       #undef SHOW_ADD
@@ -770,22 +791,38 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
               "\xe6\xb3\x95\xe6\x9c\xaf\xe5\xa2\x9e\xe5\xb9\x85(\xe7\x81\xab/\xe7\x94\xb5/\xe8\x87\xaa\xe7\x84\xb6/\xe5\x86\xb0)"},
             {"enhance_spell",
               "\xe6\xb3\x95\xe6\x9c\xaf\xe5\xa2\x9e\xe5\xb9\x85(\xe7\x81\xab/\xe7\x94\xb5/\xe8\x87\xaa\xe7\x84\xb6/\xe5\x86\xb0)"},
-            {"physical_enhance", "\xe7\x89\xa9\xe7\x90\x86\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"enhance_physical", "\xe7\x89\xa9\xe7\x90\x86\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"fire_enhance", "\xe7\x81\xab\xe7\x84\xb0\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"enhance_fire", "\xe7\x81\xab\xe7\x84\xb0\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"pulse_enhance", "\xe7\x94\xb5\xe7\xa3\x81\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"electric_enhance", "\xe7\x94\xb5\xe7\xa3\x81\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"enhance_electric", "\xe7\x94\xb5\xe7\xa3\x81\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"cryst_enhance", "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"ice_enhance", "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"enhance_ice", "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"enhance_crystal", "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"natural_enhance", "\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"nature_enhance", "\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"enhance_nature", "\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"ether_enhance", "\xe8\xb6\x85\xe5\x9f\x9f\xe5\xa2\x9e\xe5\xb9\x85"},
-            {"enhance_ether", "\xe8\xb6\x85\xe5\x9f\x9f\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"physical_enhance",
+              "\xe7\x89\xa9\xe7\x90\x86\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"enhance_physical",
+              "\xe7\x89\xa9\xe7\x90\x86\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"fire_enhance",
+              "\xe7\x81\xab\xe7\x84\xb0\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"enhance_fire",
+              "\xe7\x81\xab\xe7\x84\xb0\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"pulse_enhance",
+              "\xe7\x94\xb5\xe7\xa3\x81\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"electric_enhance",
+              "\xe7\x94\xb5\xe7\xa3\x81\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"enhance_electric",
+              "\xe7\x94\xb5\xe7\xa3\x81\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"cryst_enhance",
+              "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"ice_enhance",
+              "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"enhance_ice",
+              "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"enhance_crystal",
+              "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"natural_enhance",
+              "\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"nature_enhance",
+              "\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"enhance_nature",
+              "\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"ether_enhance",
+              "\xe8\xb6\x85\xe5\x9f\x9f\xe5\xa2\x9e\xe5\xb9\x85"},
+            {"enhance_ether",
+              "\xe8\xb6\x85\xe5\x9f\x9f\xe5\xa2\x9e\xe5\xb9\x85"},
           };
           const char *sources[] = { ab.id, ab.iconName };
           for (auto src : sources) {
@@ -813,99 +850,100 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         }
         // Show remaining non-rate blackboard entries with semantic labels
         struct { const char *raw; const char *label; bool isPct; } keyMap[] = {
-          // === Shield ===
+          // === Shield (固定值) ===
           {"shield_def_rate", "\xe6\x8a\xa4\xe7\x9b\xbe(\xe9\x98\xb2\xe5\xbe\xa1\xc3\x97)", false},
           {"shield_atk_rate", "\xe6\x8a\xa4\xe7\x9b\xbe(\xe6\x94\xbb\xe5\x87\xbb\xc3\x97)", false},
           {"shield_hp_rate",  "\xe6\x8a\xa4\xe7\x9b\xbe(\xe7\x94\x9f\xe5\x91\xbd\xc3\x97)", false},
           {"shield_base",     "\xe6\x8a\xa4\xe7\x9b\xbe\xe5\x9f\xba\xe7\xa1\x80\xe5\x80\xbc", false},
           {"FinalShield",     "\xe6\x8a\xa4\xe7\x9b\xbe", false},
           {"shield",          "\xe6\x8a\xa4\xe7\x9b\xbe", false},
-          // === Base stat ratios ===
+          // === Base stat ratios (独立乘区) ===
           {"atk_ratio",       "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", true},
           {"def_ratio",       "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", true},
           {"hp_ratio",        "\xe6\x9c\x80\xe5\xa4\xa7\xe7\x94\x9f\xe5\x91\xbd\xe5\x80\xbc", true},
           {"hp_percent",      "\xe7\x94\x9f\xe5\x91\xbd", true},
           {"heal_ratio",      "\xe6\xb2\xbb\xe7\x96\x97\xe6\xaf\x94\xe4\xbe\x8b", true},
-          {"damage",          "\xe4\xbc\xa4\xe5\xae\xb3", false},
-          {"heal",            "\xe6\xb2\xbb\xe7\x96\x97\xe9\x87\x8f", false},
-          // === Base stats (flat) ===
-          {"atk",             "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", false},
-          {"attack",           "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", true},
-          {"def",             "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", false},
-          {"defend",           "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", true},
-          {"max_hp",          "\xe6\x9c\x80\xe5\xa4\xa7\xe7\x94\x9f\xe5\x91\xbd\xe5\x80\xbc", false},
+          {"damage",          "\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"heal",            "\xe6\xb2\xbb\xe7\x96\x97\xe9\x87\x8f", true},
+          // === Base stats (基础百分比: modifierType 6 = baseMultiplier) ===
+          {"atk",             "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", true},
+          {"attack",          "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", true},
+          {"def",             "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", true},
+          {"defend",          "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", true},
+          {"max_hp",          "\xe6\x9c\x80\xe5\xa4\xa7\xe7\x94\x9f\xe5\x91\xbd\xe5\x80\xbc", true},
+          // === Buff stat ups (乘算: modifierType 1 = multiplier) ===
           {"atk_up",          "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", true},
           {"def_up",          "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", true},
           {"hp_up",           "\xe6\x9c\x80\xe5\xa4\xa7\xe7\x94\x9f\xe5\x91\xbd\xe5\x80\xbc", true},
-          // === Speed & cooldown ===
+          // === Speed & cooldown (乘算) ===
           {"move_speed",      "\xe7\xa7\xbb\xe5\x8a\xa8\xe9\x80\x9f\xe5\xba\xa6", true},
           {"move_speed_scalar","\xe7\xa7\xbb\xe5\x8a\xa8\xe9\x80\x9f\xe5\xba\xa6", true},
           {"attack_rate",     "\xe6\x94\xbb\xe5\x87\xbb\xe9\x80\x9f\xe5\xba\xa6", true},
           {"skill_cooldown",  "\xe6\x8a\x80\xe8\x83\xbd\xe5\x86\xb7\xe5\x8d\xb4", true},
           {"combo_cd_scalar", "\xe8\xbf\x9e\xe6\x90\xba\xe6\x8a\x80\xe5\x86\xb7\xe5\x8d\xb4", true},
           {"combo_cd",        "\xe8\xbf\x9e\xe6\x90\xba\xe6\x8a\x80\xe5\x86\xb7\xe5\x8d\xb4", false},
-          // === Elemental damage increase ===
+          // === Elemental damage increase (独立乘区: 伤害公式中的增伤区) ===
           {"physical_dmg_up", "\xe7\x89\xa9\xe7\x90\x86\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"fire_dmg_up",     "\xe7\x81\xab\xe7\x84\xb0\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"pulse_dmg_up",    "\xe7\x94\xb5\xe7\xa3\x81\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"cryst_dmg_up",    "\xe5\xaf\x92\xe5\x86\xb7\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"natural_dmg_up",  "\xe8\x87\xaa\xe7\x84\xb6\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"ether_dmg_up",    "\xe8\xb6\x85\xe5\x9f\x9f\xe4\xbc\xa4\xe5\xae\xb3", true},
-          // === Skill type damage increase ===
+          // === Skill type damage increase (独立乘区) ===
           {"normal_atk_dmg",  "\xe6\x99\xae\xe6\x94\xbb\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"normal_skill_dmg","\xe6\x88\x98\xe6\x8a\x80\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"combo_skill_dmg", "\xe8\xbf\x9e\xe6\x90\xba\xe6\x8a\x80\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"ult_dmg",         "\xe7\xbb\x88\xe7\xbb\x93\xe6\x8a\x80\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"dmg_scale",       "\xe4\xbc\xa4\xe5\xae\xb3\xe5\x80\x8d\xe7\x8e\x87", true},
-          // === Enhanced (增幅) per element ===
+          // === Enhanced (增幅, 独立乘区) per element ===
           {"physical_enhanced","\xe7\x89\xa9\xe7\x90\x86\xe5\xa2\x9e\xe5\xb9\x85", true},
           {"fire_enhanced",   "\xe7\x81\xab\xe7\x84\xb0\xe5\xa2\x9e\xe5\xb9\x85", true},
           {"pulse_enhanced",  "\xe7\x94\xb5\xe7\xa3\x81\xe5\xa2\x9e\xe5\xb9\x85", true},
           {"cryst_enhanced",  "\xe5\xaf\x92\xe5\x86\xb7\xe5\xa2\x9e\xe5\xb9\x85", true},
           {"natural_enhanced","\xe8\x87\xaa\xe7\x84\xb6\xe5\xa2\x9e\xe5\xb9\x85", true},
           {"ether_enhanced",  "\xe8\xb6\x85\xe5\x9f\x9f\xe5\xa2\x9e\xe5\xb9\x85", true},
-          // === Vulnerable (脆弱) per element ===
+          // === Vulnerable (脆弱, 独立乘区) per element ===
           {"physical_vulnerable","\xe7\x89\xa9\xe7\x90\x86\xe8\x84\x86\xe5\xbc\xb1", true},
           {"fire_vulnerable", "\xe7\x81\xab\xe7\x84\xb0\xe8\x84\x86\xe5\xbc\xb1", true},
           {"pulse_vulnerable","\xe7\x94\xb5\xe7\xa3\x81\xe8\x84\x86\xe5\xbc\xb1", true},
           {"cryst_vulnerable","\xe5\xaf\x92\xe5\x86\xb7\xe8\x84\x86\xe5\xbc\xb1", true},
           {"natural_vulnerable","\xe8\x87\xaa\xe7\x84\xb6\xe8\x84\x86\xe5\xbc\xb1", true},
           {"ether_vulnerable","\xe8\xb6\x85\xe5\x9f\x9f\xe8\x84\x86\xe5\xbc\xb1", true},
-          // === Burst damage (爆发伤害) per element ===
+          // === Burst damage (爆发, 独立乘区) per element ===
           {"fire_burst_dmg",  "\xe7\x81\xab\xe7\x84\xb0\xe7\x88\x86\xe5\x8f\x91", true},
           {"pulse_burst_dmg", "\xe7\x94\xb5\xe7\xa3\x81\xe7\x88\x86\xe5\x8f\x91", true},
           {"cryst_burst_dmg", "\xe5\xaf\x92\xe5\x86\xb7\xe7\x88\x86\xe5\x8f\x91", true},
           {"natural_burst_dmg","\xe8\x87\xaa\xe7\x84\xb6\xe7\x88\x86\xe5\x8f\x91", true},
-          // === Abnormal damage (异常伤害) per element ===
+          // === Abnormal damage (异常伤害, 独立乘区) per element ===
           {"fire_abnormal_dmg","\xe7\x87\x83\xe7\x83\xa7\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"pulse_abnormal_dmg","\xe5\xaf\xbc\xe7\x94\xb5\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"cryst_abnormal_dmg","\xe5\x86\xbb\xe7\xbb\x93\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"natural_abnormal_dmg","\xe8\x85\x90\xe8\x9a\x80\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"inflict_dmg",     "\xe5\xbc\x82\xe5\xb8\xb8\xe4\xbc\xa4\xe5\xae\xb3", true},
-          // === Damage taken (承伤系数) ===
+          // === Damage taken (承伤, 独立乘区) ===
           {"physical_dmg_taken","\xe7\x89\xa9\xe7\x90\x86\xe6\x89\xbf\xe4\xbc\xa4", true},
           {"fire_dmg_taken",  "\xe7\x81\xab\xe7\x84\xb0\xe6\x89\xbf\xe4\xbc\xa4", true},
           {"pulse_dmg_taken", "\xe7\x94\xb5\xe7\xa3\x81\xe6\x89\xbf\xe4\xbc\xa4", true},
           {"cryst_dmg_taken", "\xe5\xaf\x92\xe5\x86\xb7\xe6\x89\xbf\xe4\xbc\xa4", true},
           {"natural_dmg_taken","\xe8\x87\xaa\xe7\x84\xb6\xe6\x89\xbf\xe4\xbc\xa4", true},
           {"ether_dmg_taken", "\xe8\xb6\x85\xe5\x9f\x9f\xe6\x89\xbf\xe4\xbc\xa4", true},
-          // === Resist (抗性) ===
+          // === Resist (抗性, 加算) ===
           {"physical_resist", "\xe7\x89\xa9\xe7\x90\x86\xe6\x8a\x97\xe6\x80\xa7", true},
           {"fire_resist",     "\xe7\x81\xab\xe7\x84\xb0\xe6\x8a\x97\xe6\x80\xa7", true},
           {"pulse_resist",    "\xe7\x94\xb5\xe7\xa3\x81\xe6\x8a\x97\xe6\x80\xa7", true},
           {"cryst_resist",    "\xe5\xaf\x92\xe5\x86\xb7\xe6\x8a\x97\xe6\x80\xa7", true},
           {"natural_resist",  "\xe8\x87\xaa\xe7\x84\xb6\xe6\x8a\x97\xe6\x80\xa7", true},
           {"ether_resist",    "\xe8\xb6\x85\xe5\x9f\x9f\xe6\x8a\x97\xe6\x80\xa7", true},
-          // === Poise/Stagger ===
+          // === Poise/Stagger (独立乘区) ===
           {"poise_dmg_up",    "\xe5\xa4\xb1\xe8\xa1\xa1\xe5\x80\xbc\xe8\xbe\x93\xe5\x87\xba", true},
           {"poise_dmg_taken", "\xe5\xa4\xb1\xe8\xa1\xa1\xe5\x80\xbc\xe6\x89\xbf\xe5\x8f\x97", true},
           {"broken_dmg",      "\xe5\xaf\xb9\xe5\xa4\xb1\xe8\xa1\xa1\xe7\x9b\xae\xe6\xa0\x87\xe4\xbc\xa4\xe5\xae\xb3", true},
           {"break_dmg_taken", "\xe5\xa4\x84\xe5\x86\xb3\xe6\x89\xbf\xe4\xbc\xa4", true},
           {"knockdown_time",  "\xe5\x80\x92\xe5\x9c\xb0\xe6\x97\xb6\xe9\x97\xb4", false},
-          // === Crit ===
+          // === Crit (加算: modifierType 0 = addition) ===
           {"crit_rate",       "\xe6\x9a\xb4\xe5\x87\xbb\xe7\x8e\x87", true},
           {"crit_damage",     "\xe6\x9a\xb4\xe5\x87\xbb\xe4\xbc\xa4\xe5\xae\xb3", true},
-          // === Heal & shield output ===
+          // === Heal & shield output (独立乘区) ===
           {"heal_output",     "\xe6\xb2\xbb\xe7\x96\x97\xe6\x95\x88\xe6\x9e\x9c\xe5\x8a\xa0\xe6\x88\x90", true},
           {"heal_taken",      "\xe8\xa2\xab\xe6\xb2\xbb\xe7\x96\x97\xe5\x8a\xa0\xe6\x88\x90", true},
           {"shield_output",   "\xe6\x8a\xa4\xe7\x9b\xbe\xe9\x87\x8f\xe5\x8a\xa0\xe6\x88\x90", true},
@@ -914,28 +952,43 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
           {"ult_sp_gain",     "\xe7\xbb\x88\xe7\xbb\x93\xe6\x8a\x80\xe5\x85\x85\xe8\x83\xbd\xe6\x95\x88\xe7\x8e\x87", true},
           {"atb_cost",        "\xe6\x8a\x80\xe5\x8a\x9b\xe6\xb6\x88\xe8\x80\x97", false},
           {"life_steal",      "\xe5\x90\xb8\xe8\xa1\x80", true},
-          // === Weakness/Shelter ===
+          // === Weakness/Shelter (独立乘区) ===
           {"weakness_dmg",    "\xe8\x99\x9a\xe5\xbc\xb1\xe7\xb3\xbb\xe6\x95\xb0", true},
           {"shelter_dmg",     "\xe5\xba\x87\xe6\x8a\xa4\xe7\xb3\xbb\xe6\x95\xb0", true},
-          // === Status effects ===
+          // === Status effects (独立乘区) ===
           {"probability",     "\xe6\xa6\x82\xe7\x8e\x87", true},
           {"vuln_rate",       "\xe6\x98\x93\xe4\xbc\xa4", true},
           {"weaken_rate",     "\xe5\xbc\xb1\xe5\x8c\x96", true},
           {"slow_rate",       "\xe5\x87\x8f\xe9\x80\x9f", true},
           {"slow_action",     "\xe5\x8a\xa8\xe4\xbd\x9c\xe5\x87\x8f\xe9\x80\x9f", true},
-          // === Infliction (源石技艺强度) ===
+          // === Infliction (源石技艺强度, 固定值) ===
           {"infliction_enhance","\xe6\xba\x90\xe7\x9f\xb3\xe6\x8a\x80\xe8\x89\xba\xe5\xbc\xba\xe5\xba\xa6", false},
-          // === Combo zone ===
+          // === Combo zone (独立乘区) ===
           {"combo_dmg",       "\xe8\xbf\x9e\xe5\x87\xbb\xe5\xa2\x9e\xe4\xbc\xa4", true},
-          // === Normal/Crit (角色大招层数) ===
+          // === Normal/Crit ups (独立乘区) ===
           {"normal_dmg_up",   "\xe6\x99\xae\xe6\x94\xbb\xe5\xa2\x9e\xe4\xbc\xa4", true},
           {"crit_rate_up",    "\xe6\x9a\xb4\xe5\x87\xbb\xe7\x8e\x87\xe6\x8f\x90\xe5\x8d\x87", true},
           {"crit_rate_up_dynamic", "\xe6\x9a\xb4\xe5\x87\xbb\xe7\x8e\x87(\xe5\x8a\xa8\xe6\x80\x81)", true},
+          // === Numbered variant keys (weapon buffs, 乘算) ===
+          {"atk_up2",         "\xe6\x94\xbb\xe5\x87\xbb\xe5\x8a\x9b", true},
+          {"def_up2",         "\xe9\x98\xb2\xe5\xbe\xa1\xe5\x8a\x9b", true},
+          {"hp_up2",          "\xe6\x9c\x80\xe5\xa4\xa7\xe7\x94\x9f\xe5\x91\xbd\xe5\x80\xbc", true},
+          {"crit_rate2",      "\xe6\x9a\xb4\xe5\x87\xbb\xe7\x8e\x87", true},
+          {"crit_damage2",    "\xe6\x9a\xb4\xe5\x87\xbb\xe4\xbc\xa4\xe5\xae\xb3", true},
+          // === Physical damage (物理伤害) ===
+          {"phy_dmg_up",       "\xe7\x89\xa9\xe7\x90\x86\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"phy_dmg_up_mult",  "\xe7\x89\xa9\xe7\x90\x86\xe4\xbc\xa4\xe5\xae\xb3", true},
+          {"phy_spell_up",     "\xe6\xba\x90\xe7\x9f\xb3\xe6\x8a\x80\xe8\x89\xba\xe5\xbc\xba\xe5\xba\xa6", false},
+          // === Generic damage up ===
+          {"dmg_up",           "\xe4\xbc\xa4\xe5\xae\xb3\xe6\x8f\x90\xe5\x8d\x87", true},
         };
         for (int b = 0; b < ab.bbCount; b++) {
           const char *k = ab.bb[b].key;
           double v = ab.bb[b].value;
-          if (strcmp(k, "duration") == 0 || strcmp(k, "rate") == 0) continue;
+          if (strcmp(k, "duration") == 0 || strcmp(k, "duration2") == 0 || strcmp(k, "rate") == 0) continue;
+          if (strcmp(k, "max_stack") == 0 || strcmp(k, "stack") == 0) continue;
+          if (strcmp(k, "level") == 0 || strcmp(k, "lv") == 0 || strcmp(k, "prob") == 0) continue;
+          if (strcmp(k, "cd") == 0 || strcmp(k, "priority") == 0) continue;
           if (v == 0.0) continue;
           // Try semantic mapping
           bool found = false;
@@ -945,15 +998,21 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
               if (km.isPct)
                 snprintf(buf, sizeof(buf), " %s: %+.1f%%\n", km.label, v * 100.0);
               else
-                snprintf(buf, sizeof(buf), " %s: %.2f\n", km.label, v);
+                snprintf(buf, sizeof(buf), " %s: %+.1f\n", km.label, v);
               tooltip_cat(buf);
               found = true;
               break;
             }
           }
-          // Unmapped blackboard keys are intentionally hidden.
-          // They are typically internal script parameters (e.g. cooldowns, trigger flags)
-          // that clutter the UI and confuse players.
+          if (!found) {
+            // Show unmapped key with raw name for identification
+            if (v > -1.0 && v < 1.0)
+              snprintf(buf, sizeof(buf), " [%s]: %+.1f%%\n", k, v * 100.0);
+            else
+              snprintf(buf, sizeof(buf), " [%s]: %+.1f\n", k, v);
+            tooltip_cat(buf);
+            if (logOnce) Log("[UNMAPPED_KEY] buff=%s key='%s' val=%.6f", ab.id, k, v);
+          }
         }
       }
 
@@ -965,32 +1024,37 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
           if (*p == '\n') lineCount++;
         if (lineCount > 3) hasEffect = true;
         if (!hasEffect) {
-          Log("[NO_EFFECT] buff=%s icon=%s bbCount=%d", ab.id, ab.iconName, ab.bbCount);
+          if (logOnce) {
+            Log("[NO_EFFECT] buff=%s icon=%s bbCount=%d", ab.id, ab.iconName, ab.bbCount);
+          }
           // Show raw bb entries in tooltip as fallback
           for (int b = 0; b < ab.bbCount; b++) {
             const char *k = ab.bb[b].key;
             double v = ab.bb[b].value;
             if (strcmp(k, "duration") == 0 || strcmp(k, "rate") == 0) continue;
+            if (strcmp(k, "max_stack") == 0 || strcmp(k, "stack") == 0) continue;
+            if (strcmp(k, "level") == 0 || strcmp(k, "prob") == 0) continue;
             if (v == 0.0) continue;
             char buf[200];
-            // Auto-detect percentage: values between -1 and 1 (exclusive) are likely percentages
             if (v > -1.0 && v < 1.0 && v != 0.0)
               snprintf(buf, sizeof(buf), " %s: %+.1f%%\n", k, v * 100.0);
             else
               snprintf(buf, sizeof(buf), " %s: %.1f\n", k, v);
             tooltip_cat(buf);
-            Log("  bb[%d] key='%s' value=%.6f", b, ab.bb[b].key, ab.bb[b].value);
+            if (logOnce) Log("  bb[%d] key='%s' value=%.6f", b, ab.bb[b].key, ab.bb[b].value);
           }
           // Also log non-zero attributes
-          for (int j = 0; j < 94; j++) {
-            if (ab.attrs.add[j] != 0) Log("  attr add[%d]=%f", j, ab.attrs.add[j]);
-            if (ab.attrs.baseAdd[j] != 0) Log("  attr baseAdd[%d]=%f", j, ab.attrs.baseAdd[j]);
-            if (ab.attrs.mul[j] != 0) Log("  attr mul[%d]=%f", j, ab.attrs.mul[j]);
-            if (ab.attrs.baseMul[j] != 0) Log("  attr baseMul[%d]=%f", j, ab.attrs.baseMul[j]);
-            if (ab.attrs.finalAdd[j] != 0) Log("  attr finalAdd[%d]=%f", j, ab.attrs.finalAdd[j]);
-            if (ab.attrs.baseFinalAdd[j] != 0) Log("  attr baseFinalAdd[%d]=%f", j, ab.attrs.baseFinalAdd[j]);
-            if (ab.attrs.finalScl[j] != 0) Log("  attr finalScl[%d]=%f", j, ab.attrs.finalScl[j]);
-            if (ab.attrs.baseFinalScl[j] != 0) Log("  attr baseFinalScl[%d]=%f", j, ab.attrs.baseFinalScl[j]);
+          if (logOnce) {
+            for (int j = 0; j < 94; j++) {
+              if (ab.attrs.add[j] != 0) Log("  attr add[%d]=%f", j, ab.attrs.add[j]);
+              if (ab.attrs.baseAdd[j] != 0) Log("  attr baseAdd[%d]=%f", j, ab.attrs.baseAdd[j]);
+              if (ab.attrs.mul[j] != 0) Log("  attr mul[%d]=%f", j, ab.attrs.mul[j]);
+              if (ab.attrs.baseMul[j] != 0) Log("  attr baseMul[%d]=%f", j, ab.attrs.baseMul[j]);
+              if (ab.attrs.finalAdd[j] != 0) Log("  attr finalAdd[%d]=%f", j, ab.attrs.finalAdd[j]);
+              if (ab.attrs.baseFinalAdd[j] != 0) Log("  attr baseFinalAdd[%d]=%f", j, ab.attrs.baseFinalAdd[j]);
+              if (ab.attrs.finalScl[j] != 0) Log("  attr finalScl[%d]=%f", j, ab.attrs.finalScl[j]);
+              if (ab.attrs.baseFinalScl[j] != 0) Log("  attr baseFinalScl[%d]=%f", j, ab.attrs.baseFinalScl[j]);
+            }
           }
         }
       }
@@ -1003,6 +1067,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       }
     } else {
       newHover = false;
+      // Reset log throttle when mouse leaves buff area
+      s_lastLogUid = 0;
+      s_lastLogEnhance = -1;
     }
     LeaveCriticalSection(&g_buffLock);
 
@@ -1244,6 +1311,9 @@ static tLateTick oLateTick = nullptr;
 void hkLateTick(void *self, float dt, void *mi) {
   oLateTick(self, dt, mi);
 
+  // Plugin Manager: skip processing when paused
+  if (!g_pluginActive) return;
+
   // Track which MainCharHpBar is active (the one LateTick is called on)
   g_activeHpBar = self;
 
@@ -1312,14 +1382,14 @@ void hkLateTick(void *self, float dt, void *mi) {
             for (int j = 0; j < len && j < max; j++)
               dst[j] = (float)data[j];
           };
-          readArr(loader, 0x18, g_buffs[i].attrs.add, 96);
-          readArr(loader, 0x38, g_buffs[i].attrs.baseAdd, 96);
-          readArr(loader, 0x20, g_buffs[i].attrs.finalAdd, 96);
-          readArr(loader, 0x40, g_buffs[i].attrs.baseFinalAdd, 96);
-          readArr(loader, 0x10, g_buffs[i].attrs.mul, 96);
-          readArr(loader, 0x30, g_buffs[i].attrs.baseMul, 96);
-          readArr(loader, 0x28, g_buffs[i].attrs.finalScl, 96);
-          readArr(loader, 0x48, g_buffs[i].attrs.baseFinalScl, 96);
+          readArr(loader, g_offAmlAdd, g_buffs[i].attrs.add, 96);
+          readArr(loader, g_offAmlBaseAdd, g_buffs[i].attrs.baseAdd, 96);
+          readArr(loader, g_offAmlFinalAdd, g_buffs[i].attrs.finalAdd, 96);
+          readArr(loader, g_offAmlBaseFinalAdd, g_buffs[i].attrs.baseFinalAdd, 96);
+          readArr(loader, g_offAmlMul, g_buffs[i].attrs.mul, 96);
+          readArr(loader, g_offAmlBaseMul, g_buffs[i].attrs.baseMul, 96);
+          readArr(loader, g_offAmlFinalScl, g_buffs[i].attrs.finalScl, 96);
+          readArr(loader, g_offAmlBaseFinalScl, g_buffs[i].attrs.baseFinalScl, 96);
         }
       } __except(1) {}
     }
@@ -1555,20 +1625,23 @@ void hkLateTick(void *self, float dt, void *mi) {
   LeaveCriticalSection(&g_buffLock);
 
   // Lazy-load s_attributesToModify mapping (static field only available after game init)
-  if (!g_satmLoaded && g_satmField && il2cpp_field_static_get_value) {
+  // Re-check if only a few entries were loaded (game populates array gradually)
+  if (g_satmField && il2cpp_field_static_get_value && (!g_satmLoaded || g_satmLen < 10)) {
     void* satmArr = nullptr;
     il2cpp_field_static_get_value(g_satmField, &satmArr);
     if (satmArr) {
       int32_t sLen = *(int32_t *)((char *)satmArr + 0x18);
-      if (sLen > 0 && sLen <= 96) {
+      if (sLen > g_satmLen && sLen <= 96) {
         int32_t *sData = (int32_t *)((char *)satmArr + 0x20);
         for (int si = 0; si < sLen; si++)
           g_satmMap[si] = sData[si];
         g_satmLen = sLen;
         g_satmLoaded = true;
         Log("[OK] s_attributesToModify loaded: %d entries", sLen);
-        for (int si = 0; si < sLen; si++)
+        for (int si = 0; si < sLen && si < 10; si++)
           Log("  arr[%d] -> AttrType %d (%s)", si, g_satmMap[si], GetAttrName(g_satmMap[si]));
+        if (sLen > 10)
+          Log("  ... (%d more entries)", sLen - 10);
       }
     }
   }
@@ -1592,13 +1665,29 @@ DWORD WINAPI OverlayThread(LPVOID) {
     }
   }
 
-  // Wait for game window
+  // Find game window belonging to THIS process (not any other Unity app)
+  DWORD myPid = GetCurrentProcessId();
   while (g_running && !g_gameHwnd) {
-    g_gameHwnd = FindWindowA("UnityWndClass", NULL);
-    Sleep(500);
+    struct FindCtx { DWORD pid; HWND result; } ctx = { myPid, nullptr };
+    EnumWindows([](HWND hw, LPARAM lp) -> BOOL {
+      auto *c = (FindCtx *)lp;
+      DWORD wndPid = 0;
+      GetWindowThreadProcessId(hw, &wndPid);
+      if (wndPid != c->pid) return TRUE; // skip other processes
+      char cls[64] = {};
+      GetClassNameA(hw, cls, sizeof(cls));
+      if (strcmp(cls, "UnityWndClass") == 0) {
+        c->result = hw;
+        return FALSE; // found
+      }
+      return TRUE;
+    }, (LPARAM)&ctx);
+    g_gameHwnd = ctx.result;
+    if (!g_gameHwnd) Sleep(500);
   }
   if (!g_gameHwnd)
     return 0;
+  Log("[OK] Game window found: %p (PID=%u)", g_gameHwnd, myPid);
 
   WNDCLASSA wc = {0};
   wc.lpfnWndProc = OverlayWndProc;
@@ -1701,7 +1790,7 @@ DWORD WINAPI MainThread(LPVOID) {
   g_logHandle = CreateFileA(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
 
-  Log("=== EndfieldCombatHUD Phase 2d: Lightweight Overlay ===");
+  Log("=== EndfieldCombatHUD ===");
   for (int i = 0; i < 120; i++) {
     if (GetModuleHandleW(L"GameAssembly.dll"))
       break;
@@ -1780,17 +1869,43 @@ DWORD WINAPI MainThread(LPVOID) {
   if (amlClass) {
     g_getAttrAdd = FindMethod(amlClass, "get_attributeAdditions", 0);
     g_getAttrMul = FindMethod(amlClass, "get_attributeMultipliers", 0);
-    // Find s_attributesToModify static field (maps array index -> AttributeType)
+
+    // Enumerate all fields to resolve modifier array offsets dynamically
     void* amlIter = nullptr;
     void* amlField;
+    Log("  AttributeModifierLoader fields:");
     while ((amlField = il2cpp_class_get_fields(amlClass, &amlIter))) {
       const char* afname = il2cpp_field_get_name(amlField);
-      if (afname && strcmp(afname, "s_attributesToModify") == 0) {
+      int afoff = il2cpp_field_get_offset(amlField);
+      if (!afname) continue;
+      Log("    [0x%X] %s", afoff, afname);
+
+      // Resolve s_attributesToModify static field
+      if (strcmp(afname, "s_attributesToModify") == 0) {
         g_satmField = amlField;
-        break;
       }
+      // Resolve modifier array offsets by field name
+      // Game uses m_attribute* prefix naming convention
+      if (strcmp(afname, "m_attributeAdditions") == 0 || strcmp(afname, "m_addition") == 0)
+        g_offAmlAdd = afoff;
+      else if (strcmp(afname, "m_attributeMultipliers") == 0 || strcmp(afname, "m_multiplier") == 0)
+        g_offAmlMul = afoff;
+      else if (strcmp(afname, "m_attributeFinalAdditions") == 0 || strcmp(afname, "m_finalAddition") == 0)
+        g_offAmlFinalAdd = afoff;
+      else if (strcmp(afname, "m_attributeFinalScalars") == 0 || strcmp(afname, "m_finalMultiplier") == 0)
+        g_offAmlFinalScl = afoff;
+      else if (strcmp(afname, "m_attributeBaseAdditions") == 0 || strcmp(afname, "m_baseAddition") == 0)
+        g_offAmlBaseAdd = afoff;
+      else if (strcmp(afname, "m_attributeBaseMultipliers") == 0 || strcmp(afname, "m_baseMultiplier") == 0)
+        g_offAmlBaseMul = afoff;
+      else if (strcmp(afname, "m_attributeBaseFinalAdditions") == 0 || strcmp(afname, "m_baseFinalAddition") == 0)
+        g_offAmlBaseFinalAdd = afoff;
+      else if (strcmp(afname, "m_attributeBaseFinalScalars") == 0 || strcmp(afname, "m_baseFinalMultiplier") == 0)
+        g_offAmlBaseFinalScl = afoff;
     }
-    Log("[OK] AttributeModifierLoader resolved");
+    Log("[OK] AttributeModifierLoader resolved: add=0x%X mul=0x%X finalAdd=0x%X finalScl=0x%X baseAdd=0x%X baseMul=0x%X baseFinalAdd=0x%X baseFinalScl=0x%X",
+      g_offAmlAdd, g_offAmlMul, g_offAmlFinalAdd, g_offAmlFinalScl,
+      g_offAmlBaseAdd, g_offAmlBaseMul, g_offAmlBaseFinalAdd, g_offAmlBaseFinalScl);
   }
 
 
@@ -1886,4 +2001,30 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
     CreateThread(NULL, 0, MainThread, NULL, 0, NULL);
   }
   return TRUE;
+}
+
+// ============================================================================
+// Plugin Manager Interface
+// ============================================================================
+static AP_PluginInfo s_pluginInfo = {
+    APPLEPIE_PLUGIN_API_VERSION,
+    "combat_hud",
+    "Combat HUD",
+    "Display buff details and attribute bonuses",
+    nullptr,
+    true  // supports hot disable
+};
+
+APPLEPIE_PLUGIN_EXPORT AP_PluginInfo* AP_GetPluginInfo() {
+    return &s_pluginInfo;
+}
+
+APPLEPIE_PLUGIN_EXPORT bool AP_PluginEnable() {
+    g_pluginActive = true;
+    return true;
+}
+
+APPLEPIE_PLUGIN_EXPORT bool AP_PluginDisable() {
+    g_pluginActive = false;
+    return true;
 }
