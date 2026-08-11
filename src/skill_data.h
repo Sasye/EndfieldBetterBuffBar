@@ -6,6 +6,7 @@
 // ============================================================================
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <windows.h>
 
 // Game window dimensions and overlay offset (set by timer handler in combat_hud.cpp)
@@ -499,6 +500,9 @@ static HFONT s_skillFont = nullptr;
 static int   s_skillLastH = 0;
 
 static void DrawSkillHud(HDC hdc, HWND hwnd) {
+  // Toggle check: user can hide skill HUD via F11
+  if (!g_showSkillHud) return;
+
   // Check if data is valid and recent (within 3 seconds)
   SkillHudState local;
   EnterCriticalSection(&g_skillLock);
@@ -588,23 +592,40 @@ static void DrawSkillHud(HDC hdc, HWND hwnd) {
       int y = startY + slotIdx * slotH;
       int x = centerX - blockGap - barW + curveOff[slotIdx];
 
+      // Visual enhance: determine colors based on state
+      bool enhReady = g_visualEnhance && s.ready;
+      bool enhApproach = g_visualEnhance && !s.ready && s.cooldown > 0.0f && s.cooldown < 3.0f;
+      COLORREF textClr = RGB(220, 220, 220);
+      COLORREF barClr  = s.ready ? RGB(220, 220, 220) : RGB(80, 160, 240);
+
+      if (enhReady) {
+        textClr = RGB(100, 240, 255);  // bright cyan
+        barClr  = RGB(100, 240, 255);
+      } else if (enhApproach) {
+        // Lerp white -> cyan as CD approaches 0 (3s..0s)
+        float t = 1.0f - (s.cooldown / 3.0f);
+        int r = 220 - (int)(120 * t); // 220 -> 100
+        int g = 220 + (int)(20 * t);  // 220 -> 240
+        int b = 220 + (int)(35 * t);  // 220 -> 255
+        textClr = RGB(r, g, b);
+      }
+
       // Text: "ready" or "12.3s" — centered above bar
       wchar_t buf[64];
       if (s.ready) {
         wsprintfW(buf, L"ready");
-        SetTextColor(hdc, RGB(220, 220, 220));
       } else {
         int cdSec = (int)(s.cooldown * 10);
         wsprintfW(buf, L"%d.%ds", cdSec / 10, cdSec % 10);
-        SetTextColor(hdc, RGB(220, 220, 220));
       }
-      COLORREF clr = RGB(220, 220, 220);
       RECT lr = {x, y, x + barW, y + textH};
-      DrawOutlinedText(hdc, buf, &lr, DT_SINGLELINE | DT_CENTER, clr);
+      DrawOutlinedText(hdc, buf, &lr, DT_SINGLELINE | DT_CENTER, textClr);
 
       // Progress bar
       y += textH;
-      RECT barBg = {x, y, x + barW, y + barH};
+      int drawBarH = barH;
+      if (enhReady) drawBarH = (int)(barH * 1.6f); // thicker when ready
+      RECT barBg = {x, y, x + barW, y + drawBarH};
       HBRUSH bgBr = CreateSolidBrush(RGB(35, 38, 45));
       FillRect(hdc, &barBg, bgBr);
       DeleteObject(bgBr);
@@ -617,9 +638,8 @@ static void DrawSkillHud(HDC hdc, HWND hwnd) {
       }
       int fillW = (int)(barW * progress);
       if (fillW > 0) {
-        RECT barFill = {x + barW - fillW, y, x + barW, y + barH};
-        HBRUSH fillBr = CreateSolidBrush(
-            s.ready ? RGB(220, 220, 220) : RGB(80, 160, 240));
+        RECT barFill = {x + barW - fillW, y, x + barW, y + drawBarH};
+        HBRUSH fillBr = CreateSolidBrush(barClr);
         FillRect(hdc, &barFill, fillBr);
         DeleteObject(fillBr);
       }
@@ -639,29 +659,51 @@ static void DrawSkillHud(HDC hdc, HWND hwnd) {
       int y = startY + slotIdx * slotH;
       int x = centerX + blockGap - curveOff[slotIdx];
 
+      // Visual enhance: determine colors based on state
+      bool enhReady = g_visualEnhance && u.ready;
+      bool enhApproach = g_visualEnhance && !u.ready && u.chargePercent >= 0.8f;
+      COLORREF textClr = RGB(220, 220, 220);
+      COLORREF barClr  = u.ready ? RGB(220, 220, 220) : RGB(240, 200, 60);
+
+      if (enhReady) {
+        // Gold pulse: oscillate brightness at ~1Hz using GetTickCount
+        float phase = (float)(GetTickCount() % 1000) / 1000.0f;
+        float pulse = 0.5f + 0.5f * (float)sin(phase * 6.2831853f); // 0..1
+        int r = 200 + (int)(55 * pulse);  // 200..255
+        int g2 = 160 + (int)(40 * pulse); // 160..200
+        int b2 = 20  + (int)(30 * pulse); //  20..50
+        textClr = RGB(r, g2, b2);
+        barClr  = RGB(r, g2, b2);
+      } else if (enhApproach) {
+        // Lerp white -> gold as charge approaches 100% (80%..100%)
+        float t = (u.chargePercent - 0.8f) / 0.2f; // 0..1
+        int r = 220 + (int)(35 * t);  // 220 -> 255
+        int g2 = 220 - (int)(20 * t); // 220 -> 200
+        int b2 = 220 - (int)(170 * t);// 220 -> 50
+        textClr = RGB(r, g2, b2);
+      }
+
       // Text: "ready" or "5/10 50%" — centered above bar
       wchar_t buf[64];
       if (u.ready) {
         wsprintfW(buf, L"ready");
-        SetTextColor(hdc, RGB(220, 220, 220));
       } else if (u.hasActualValues && u.maxCharge > 0.01f) {
         int cur = (int)u.charge;
         int max = (int)u.maxCharge;
         int pct = (int)(u.chargePercent * 100.0f);
         wsprintfW(buf, L"%d/%d %d%%", cur, max, pct);
-        SetTextColor(hdc, RGB(220, 220, 220));
       } else {
         int pct = (int)(u.chargePercent * 100.0f);
         wsprintfW(buf, L"%d%%", pct);
-        SetTextColor(hdc, RGB(220, 220, 220));
       }
-      COLORREF clr = RGB(220, 220, 220);
       RECT lr = {x, y, x + barW, y + textH};
-      DrawOutlinedText(hdc, buf, &lr, DT_SINGLELINE | DT_CENTER, clr);
+      DrawOutlinedText(hdc, buf, &lr, DT_SINGLELINE | DT_CENTER, textClr);
 
       // Progress bar
       y += textH;
-      RECT barBg = {x, y, x + barW, y + barH};
+      int drawBarH = barH;
+      if (enhReady) drawBarH = (int)(barH * 1.6f); // thicker when ready
+      RECT barBg = {x, y, x + barW, y + drawBarH};
       HBRUSH bgBr = CreateSolidBrush(RGB(35, 38, 45));
       FillRect(hdc, &barBg, bgBr);
       DeleteObject(bgBr);
@@ -671,9 +713,8 @@ static void DrawSkillHud(HDC hdc, HWND hwnd) {
       if (progress > 1.0f) progress = 1.0f;
       int fillW = (int)(barW * progress);
       if (fillW > 0) {
-        RECT barFill = {x, y, x + fillW, y + barH};
-        HBRUSH fillBr = CreateSolidBrush(
-            u.ready ? RGB(220, 220, 220) : RGB(240, 200, 60));
+        RECT barFill = {x, y, x + fillW, y + drawBarH};
+        HBRUSH fillBr = CreateSolidBrush(barClr);
         FillRect(hdc, &barFill, fillBr);
         DeleteObject(fillBr);
       }

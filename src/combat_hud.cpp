@@ -2,6 +2,7 @@
 #include "applepie_mgr.h"
 #include "MinHook.h"
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -10,6 +11,13 @@
 extern "C" __declspec(dllexport) void DummyExport() {}
 static volatile bool g_pluginActive = true;
 static volatile bool g_langZh = true; // true=Chinese, false=English; toggled by AP_SetLanguage
+
+// HUD visibility toggles (hotkeys F11/F12, persisted in config)
+static volatile bool g_showSkillHud = true;
+static volatile bool g_showBuffHud = true;
+static volatile bool g_visualEnhance = false; // ready-state glow/pulse (default OFF)
+static int g_vkSkillHud = VK_F11;  // 0x7A
+static int g_vkBuffHud  = VK_F12;  // 0x7B
 
 // Language selector: picks Chinese or English string at zero cost
 #define L(zh, en) (g_langZh ? (zh) : (en))
@@ -44,6 +52,9 @@ void Log(const char *fmt, ...) {
 #include "buff_names.h"
 #include "skill_data.h"
 
+// Forward declarations for config functions (defined in Plugin Manager section)
+static void LoadConfig();
+static void SaveConfig();
 
 // ============================================================================
 // Tooltip State (shared between hook thread and overlay thread)
@@ -412,6 +423,26 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       }
     }
 
+    // Hotkey detection (edge-triggered: fires once per keypress)
+    {
+      static bool s_prevSkillKey = false;
+      static bool s_prevBuffKey = false;
+      bool curSkill = (GetAsyncKeyState(g_vkSkillHud) & 0x8000) != 0;
+      bool curBuff  = (GetAsyncKeyState(g_vkBuffHud)  & 0x8000) != 0;
+      if (curSkill && !s_prevSkillKey) {
+        g_showSkillHud = !g_showSkillHud;
+        g_needRepaint = true;
+        Log("[HOTKEY] Skill HUD: %s", g_showSkillHud ? "ON" : "OFF");
+      }
+      if (curBuff && !s_prevBuffKey) {
+        g_showBuffHud = !g_showBuffHud;
+        g_needRepaint = true;
+        Log("[HOTKEY] Buff HUD: %s", g_showBuffHud ? "ON" : "OFF");
+      }
+      s_prevSkillKey = curSkill;
+      s_prevBuffKey = curBuff;
+    }
+
     // Sync overlay to content-tight region (not fullscreen)
     // DWM compositing cost is proportional to overlay area; at 4K a fullscreen
     RECT gr;
@@ -537,7 +568,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     static uint32_t s_lastLogUid = 0;
     static int s_lastLogEnhance = -1;
 
-    if (newHover && hoveredVisIdx >= 0 && hoveredVisIdx < visibleCount) {
+    if (newHover && g_showBuffHud && hoveredVisIdx >= 0 && hoveredVisIdx < visibleCount) {
       int bIdx = visibleMap[hoveredVisIdx];
       if (bIdx >= 0 && bIdx < g_buffCount) {
         ActiveBuff ab = g_buffs[bIdx]; // Copy for aggregation
@@ -1996,6 +2027,10 @@ DWORD WINAPI MainThread(LPVOID) {
   // ========== Phase 2: Skill HUD hooks ==========
   InitSkillHooks(asms, ac);
 
+  // Load config (hotkey bindings, visual_enhance setting)
+  LoadConfig();
+  SaveConfig(); // create default file if it doesn't exist
+
   // Start overlay thread AFTER game is fully loaded
   CreateThread(NULL, 0, OverlayThread, NULL, 0, NULL);
   Log("Overlay thread started.");
@@ -2013,19 +2048,63 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
 }
 
 // ============================================================================
+// Config File (plugin\combat_hud_config.txt)
+// ============================================================================
+static char g_configPath[MAX_PATH] = {};
+
+static void InitConfigPath() {
+    if (g_configPath[0]) return;
+    char p[MAX_PATH];
+    GetModuleFileNameA(NULL, p, MAX_PATH);
+    std::string d(p);
+    size_t pos = d.find_last_of("\\/");
+    if (pos != std::string::npos) d = d.substr(0, pos + 1);
+    snprintf(g_configPath, sizeof(g_configPath), "%splugin\\combat_hud_config.txt", d.c_str());
+}
+
+static void LoadConfig() {
+    InitConfigPath();
+    FILE *f = fopen(g_configPath, "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char key[128]; char val[128];
+        if (sscanf(line, "%127[^=]=%127s", key, val) == 2) {
+            if (strcmp(key, "toggle_skill_hud") == 0) g_vkSkillHud = (int)strtol(val, NULL, 0);
+            else if (strcmp(key, "toggle_buff_hud") == 0) g_vkBuffHud = (int)strtol(val, NULL, 0);
+            else if (strcmp(key, "visual_enhance") == 0) g_visualEnhance = (atoi(val) != 0);
+        }
+    }
+    fclose(f);
+    Log("[CONFIG] Loaded: skill_hud=0x%X buff_hud=0x%X visual_enhance=%d",
+        g_vkSkillHud, g_vkBuffHud, (int)g_visualEnhance);
+}
+
+static void SaveConfig() {
+    InitConfigPath();
+    FILE *f = fopen(g_configPath, "w");
+    if (!f) return;
+    fprintf(f, "toggle_skill_hud=0x%X\n", g_vkSkillHud);
+    fprintf(f, "toggle_buff_hud=0x%X\n", g_vkBuffHud);
+    fprintf(f, "visual_enhance=%d\n", (int)g_visualEnhance);
+    fclose(f);
+}
+
+// ============================================================================
 // Plugin Manager Interface
 // ============================================================================
+static AP_HotkeyInfo s_hotkeys[2];
+
 static AP_PluginInfo s_pluginInfo = {
     APPLEPIE_PLUGIN_API_VERSION,
     "combat_hud",
     "Combat HUD \xe6\x88\x98\xe6\x96\x97\xe4\xbf\xa1\xe6\x81\xaf",        // 战斗信息
     "\xe6\x98\xbe\xe7\xa4\xba" "Buff\xe8\xaf\xa6\xe6\x83\x85\xe4\xb8\x8e\xe5\xb1\x9e\xe6\x80\xa7\xe5\x8a\xa0\xe6\x88\x90",  // 显示Buff详情与属性加成
-    nullptr,
+    "combat_hud_config.txt",
     true  // supports hot disable
 };
 
 APPLEPIE_PLUGIN_EXPORT AP_PluginInfo* AP_GetPluginInfo() {
-    // Update language-dependent strings
     s_pluginInfo.displayName = L("Combat HUD \xe6\x88\x98\xe6\x96\x97\xe4\xbf\xa1\xe6\x81\xaf",
                                   "Combat HUD");
     s_pluginInfo.description = L("\xe6\x98\xbe\xe7\xa4\xba" "Buff\xe8\xaf\xa6\xe6\x83\x85\xe4\xb8\x8e\xe5\xb1\x9e\xe6\x80\xa7\xe5\x8a\xa0\xe6\x88\x90",
@@ -2048,4 +2127,24 @@ APPLEPIE_PLUGIN_EXPORT void AP_SetLanguage(const char* langCode) {
     g_langZh = (langCode && langCode[0] == 'z');
     if (wasZh != g_langZh)
         Log("[LANG] Language switched to: %s", g_langZh ? "zh" : "en");
+}
+
+APPLEPIE_PLUGIN_EXPORT int AP_GetHotkeys(AP_HotkeyInfo* outArray, int maxCount) {
+    s_hotkeys[0] = {
+        L("\xe5\x88\x87\xe6\x8d\xa2\xe6\x8a\x80\xe8\x83\xbd\xe6\x98\xbe\xe7\xa4\xba", "Toggle Skill HUD"),  // 切换技能显示
+        "toggle_skill_hud", g_vkSkillHud
+    };
+    s_hotkeys[1] = {
+        L("\xe5\x88\x87\xe6\x8d\xa2" "Buff\xe6\x98\xbe\xe7\xa4\xba", "Toggle Buff HUD"),  // 切换Buff显示
+        "toggle_buff_hud", g_vkBuffHud
+    };
+    int count = 2;
+    if (count > maxCount) count = maxCount;
+    for (int i = 0; i < count; i++) outArray[i] = s_hotkeys[i];
+    return count;
+}
+
+APPLEPIE_PLUGIN_EXPORT bool AP_ReloadConfig() {
+    LoadConfig();
+    return true;
 }
