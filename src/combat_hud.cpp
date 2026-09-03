@@ -1440,27 +1440,40 @@ void hkLateTick(void *self, float dt, void *mi) {
   if (g_getBuffInstanceUid) {
     void *buffNode = nullptr;
     int listOffset = 0;
+    bool buffNodeIsGpui = false;
 
-    // GPUIBuffNode at self+0xD8, its m_orderedBuffCellList at offset 0xB0
+    // Prefer reflected MainCharHpBar/GPUIBuffNode fields. Legacy offsets remain
+    // available only when reflection could not resolve a field.
     __try {
-      void *gpui = *(void **)((char *)self + 0xD8);
+      void *gpui = nullptr;
+      if (g_offHpBar_gpuiBuffNode >= 0)
+        gpui = *(void **)((char *)self + g_offHpBar_gpuiBuffNode);
+      else
+        gpui = *(void **)((char *)self + 0xD8);
 
       if (gpui) {
-        void *ol = *(void **)((char *)gpui + 0xB0);
+        int gpuiListOffset = g_gpuiOrderedListOffset > 0
+            ? (int)g_gpuiOrderedListOffset : 0xB0;
+        void *ol = *(void **)((char *)gpui + gpuiListOffset);
         if (ol) {
           int sz = *(int *)((char *)ol + 0x18);
           if (sz > 0) {
             buffNode = gpui;
-            listOffset = 0xB0;
+            listOffset = gpuiListOffset;
+            buffNodeIsGpui = true;
           }
         }
       }
     } __except(1) {}
 
-    // Fallback: UIBuffNode at self+0xD0, its m_orderedBuffCellList at g_orderedListOffset
+    // Fallback: reflected UIBuffNode and its m_orderedBuffCellList.
     if (!buffNode && g_orderedListOffset > 0) {
       __try {
-        void *uibn = *(void **)((char *)self + 0xD0);
+        void *uibn = nullptr;
+        if (g_offHpBar_buffNode >= 0)
+          uibn = *(void **)((char *)self + g_offHpBar_buffNode);
+        else
+          uibn = *(void **)((char *)self + 0xD0);
         if (uibn) {
           void *ol = *(void **)((char *)uibn + g_orderedListOffset);
           if (ol) {
@@ -1468,6 +1481,26 @@ void hkLateTick(void *self, float dt, void *mi) {
             if (sz > 0) {
               buffNode = uibn;
               listOffset = (int)g_orderedListOffset;
+            }
+          }
+        }
+      } __except(1) {}
+    }
+    // Additive legacy branch for builds where UIBuffNode reflection is absent.
+    if (!buffNode && g_orderedListOffset == 0) {
+      __try {
+        void *uibn = nullptr;
+        if (g_offHpBar_buffNode >= 0)
+          uibn = *(void **)((char *)self + g_offHpBar_buffNode);
+        else
+          uibn = *(void **)((char *)self + 0xD0);
+        if (uibn) {
+          void *ol = *(void **)((char *)uibn + 0xA8);
+          if (ol) {
+            int sz = *(int *)((char *)ol + 0x18);
+            if (sz > 0) {
+              buffNode = uibn;
+              listOffset = 0xA8;
             }
           }
         }
@@ -1486,15 +1519,38 @@ void hkLateTick(void *self, float dt, void *mi) {
             ActiveBuff newBuffs[64];
             int newBuffCount = 0;
 
-            // Read stack counts from GPUIBuffNode.m_stackBuffsDict (0xA8)
-            // DynamicFastLookupCollection -> m_list (+0x18) -> List<ValueTuple<String, List<ObjectPtr<Buff>>>>
+            // Read stack counts from the reflected node-specific stack table.
+            // DynamicFastLookupCollection.m_list is resolved lazily from its
+            // constructed runtime class; List/array layouts are IL2CPP ABI.
             struct StackEntry { char id[128]; int count; };
             StackEntry stackCounts[32];
             int stackCountN = 0;
             __try {
-              void *stackDict = *(void **)((char *)buffNode + 0xA8);
+              int stackDictOffset = buffNodeIsGpui
+                  ? (g_gpuiStackBuffsOffset > 0
+                      ? (int)g_gpuiStackBuffsOffset : 0xA8)
+                  : (g_uiStackBuffsOffset > 0
+                      ? (int)g_uiStackBuffsOffset : 0xA0);
+              void *stackDict =
+                  *(void **)((char *)buffNode + stackDictOffset);
               if (stackDict) {
-                void *mList = *(void **)((char *)stackDict + 0x18);
+                static void *s_lookupClass = nullptr;
+                static int s_lookupListOffset = -2;
+                if (il2cpp_object_get_class) {
+                  void *lookupClass = il2cpp_object_get_class(stackDict);
+                  if (lookupClass && lookupClass != s_lookupClass) {
+                    const char *listNames[] = {"m_list", "_list", "list"};
+                    s_lookupClass = lookupClass;
+                    s_lookupListOffset =
+                        FindFieldInHierarchy(lookupClass, listNames, 3);
+                    Log("[DIAG] DynamicFastLookupCollection.m_list offset: 0x%X",
+                        s_lookupListOffset);
+                  }
+                }
+                int lookupListOffset = s_lookupListOffset >= 0
+                    ? s_lookupListOffset : 0x18;
+                void *mList =
+                    *(void **)((char *)stackDict + lookupListOffset);
                 if (mList) {
                   int listSize = *(int *)((char *)mList + 0x18);
                   void *listItems = *(void **)((char *)mList + 0x10);
@@ -1589,7 +1645,11 @@ void hkLateTick(void *self, float dt, void *mi) {
                     if (cellBuff) {
                       char cellId[128] = {};
                       __try {
-                        void *idStr = *(void **)((char *)cellBuff + 0x140);
+                        void *idStr = nullptr;
+                        if (g_buffIdOffset > 0)
+                          idStr = *(void **)((char *)cellBuff + g_buffIdOffset);
+                        else
+                          idStr = *(void **)((char *)cellBuff + 0x140);
                         if (idStr) ReadStr(idStr, cellId, sizeof(cellId));
                       } __except(1) {}
                       if (cellId[0] && strcmp(g_buffs[bi].id, cellId) == 0) {
@@ -1875,6 +1935,18 @@ DWORD WINAPI MainThread(LPVOID) {
       if (bfname && strcmp(bfname, "m_attributeModifierLoader") == 0) {
         g_loaderOffset = bfoff;
       }
+      if (bfname && (strcmp(bfname, "m_data") == 0 ||
+                     strcmp(bfname, "<buffData>k__BackingField") == 0)) {
+        g_buffDataOffset = bfoff;
+      }
+      if (bfname && (strcmp(bfname, "<id>k__BackingField") == 0 ||
+                     strcmp(bfname, "m_id") == 0)) {
+        g_buffIdOffset = bfoff;
+      }
+      if (bfname && (strcmp(bfname, "<blackboard>k__BackingField") == 0 ||
+                     strcmp(bfname, "m_blackboard") == 0)) {
+        g_buffBlackboardOffset = bfoff;
+      }
     }
     if (g_loaderOffset > 0)
       Log("[OK] Buff.m_attributeModifierLoader offset: 0x%X", (int)g_loaderOffset);
@@ -1901,9 +1973,67 @@ DWORD WINAPI MainThread(LPVOID) {
       if (g_loaderOffset > 0)
         Log("[OK] Found in parent: offset 0x%X", (int)g_loaderOffset);
     }
+
+    // Resolve the remaining Buff fields through the full hierarchy if they
+    // were not declared directly on the current game version's Buff class.
+    if (g_buffDataOffset == 0) {
+      const char *dataNames[] = {"m_data", "<buffData>k__BackingField"};
+      int off = FindFieldInHierarchy(buffClass, dataNames, 2);
+      if (off >= 0) g_buffDataOffset = (size_t)off;
+    }
+    if (g_buffIdOffset == 0) {
+      const char *idNames[] = {"<id>k__BackingField", "m_id"};
+      int off = FindFieldInHierarchy(buffClass, idNames, 2);
+      if (off >= 0) g_buffIdOffset = (size_t)off;
+    }
+    if (g_buffBlackboardOffset == 0) {
+      const char *bbNames[] = {"<blackboard>k__BackingField", "m_blackboard"};
+      int off = FindFieldInHierarchy(buffClass, bbNames, 2);
+      if (off >= 0) g_buffBlackboardOffset = (size_t)off;
+    }
+
     Log("[OK] Buff class resolved (loaderOffset=0x%X)", (int)g_loaderOffset);
+    if (g_buffDataOffset > 0)
+      Log("[OK] Buff data field offset: 0x%X", (int)g_buffDataOffset);
+    else
+      Log("[WARN] Buff data field not found, using legacy offset 0x18");
+    if (g_buffIdOffset > 0)
+      Log("[OK] Buff id backing field offset: 0x%X", (int)g_buffIdOffset);
+    else
+      Log("[WARN] Buff id backing field not found, using legacy offset 0x140");
+    if (g_buffBlackboardOffset > 0)
+      Log("[OK] Buff blackboard backing field offset: 0x%X",
+          (int)g_buffBlackboardOffset);
+    else
+      Log("[WARN] Buff blackboard backing field not found, using legacy offset 0x158");
 
   }
+
+  // Resolve the two nested fields used by the buff icon-name path.
+  void *buffDataClass = FindClass("Beyond.Gameplay.Core", "BuffData", asms, ac);
+  if (buffDataClass) {
+    const char *iconConfigNames[] = {"iconConfig", "m_iconConfig", "_iconConfig"};
+    int off = FindFieldInHierarchy(buffDataClass, iconConfigNames, 3);
+    if (off >= 0) g_buffDataIconConfigOffset = (size_t)off;
+  }
+  if (g_buffDataIconConfigOffset > 0)
+    Log("[OK] BuffData.iconConfig offset: 0x%X",
+        (int)g_buffDataIconConfigOffset);
+  else
+    Log("[WARN] BuffData.iconConfig not found, using legacy offset 0x18");
+
+  void *buffIconConfigClass =
+      FindClass("Beyond.Gameplay.Core", "BuffIconConfig", asms, ac);
+  if (buffIconConfigClass) {
+    const char *spritePathNames[] = {"_spritePath", "m_spritePath", "spritePath"};
+    int off = FindFieldInHierarchy(buffIconConfigClass, spritePathNames, 3);
+    if (off >= 0) g_buffIconSpritePathOffset = (size_t)off;
+  }
+  if (g_buffIconSpritePathOffset > 0)
+    Log("[OK] BuffIconConfig sprite path offset: 0x%X",
+        (int)g_buffIconSpritePathOffset);
+  else
+    Log("[WARN] BuffIconConfig sprite path not found, using legacy offset 0x10");
 
   void *amlClass = FindClass("", "AttributeModifierLoader", asms, ac);
   if (amlClass) {
@@ -1977,6 +2107,18 @@ DWORD WINAPI MainThread(LPVOID) {
       Log("[OK] MainCharHpBar.buffNode offset=0x%X (field=%s)", g_offHpBar_buffNode, bnMatch);
     else
       Log("[WARN] MainCharHpBar.buffNode NOT found, display order will use fallback");
+
+    const char *gpuiNames[] = {
+      "gpuiBuffNode", "_gpuiBuffNode", "m_gpuiBuffNode"
+    };
+    const char *gpuiMatch = nullptr;
+    g_offHpBar_gpuiBuffNode =
+        FindFieldInHierarchy(hpClass, gpuiNames, 3, &gpuiMatch);
+    if (g_offHpBar_gpuiBuffNode >= 0)
+      Log("[OK] MainCharHpBar.gpuiBuffNode offset=0x%X (field=%s)",
+          g_offHpBar_gpuiBuffNode, gpuiMatch);
+    else
+      Log("[WARN] MainCharHpBar.gpuiBuffNode NOT found, using legacy offset 0xD8");
   }
 
   // Resolve UIBuffCell.get_buffInstanceUid for display order tracking
@@ -1985,10 +2127,44 @@ DWORD WINAPI MainThread(LPVOID) {
     g_getBuffInstanceUid = FindMethod(buffCellClass, "get_buffInstanceUid", 0);
     Log("[OK] UIBuffCell.get_buffInstanceUid: %p", g_getBuffInstanceUid);
   }
+  if (!g_getBuffInstanceUid) {
+    void *gpuiBuffCellClass =
+        FindClass("Beyond.UI", "GPUIBuffCell", asms, ac);
+    if (gpuiBuffCellClass) {
+      g_getBuffInstanceUid =
+          FindMethod(gpuiBuffCellClass, "get_buffInstanceUid", 0);
+      Log("[OK] GPUIBuffCell.get_buffInstanceUid fallback: %p",
+          g_getBuffInstanceUid);
+    }
+  }
 
   // Hook GPUIBuffNode._OnBuffEnhanceChanged for stack tracking
   void *gpuiBuffNodeClass = FindClass("Beyond.UI", "GPUIBuffNode", asms, ac);
   if (gpuiBuffNodeClass) {
+    const char *orderedNames[] = {
+      "m_orderedBuffCellList", "_orderedBuffCellList"
+    };
+    int orderedOff =
+        FindFieldInHierarchy(gpuiBuffNodeClass, orderedNames, 2);
+    if (orderedOff >= 0)
+      g_gpuiOrderedListOffset = (size_t)orderedOff;
+
+    const char *stackNames[] = {"m_stackBuffsDict", "_stackBuffsDict"};
+    int stackOff = FindFieldInHierarchy(gpuiBuffNodeClass, stackNames, 2);
+    if (stackOff >= 0)
+      g_gpuiStackBuffsOffset = (size_t)stackOff;
+
+    if (g_gpuiOrderedListOffset > 0)
+      Log("[OK] GPUIBuffNode.m_orderedBuffCellList offset: 0x%X",
+          (int)g_gpuiOrderedListOffset);
+    else
+      Log("[WARN] GPUIBuffNode ordered list not found, using legacy offset 0xB0");
+    if (g_gpuiStackBuffsOffset > 0)
+      Log("[OK] GPUIBuffNode.m_stackBuffsDict offset: 0x%X",
+          (int)g_gpuiStackBuffsOffset);
+    else
+      Log("[WARN] GPUIBuffNode stack dictionary not found, using legacy offset 0xA8");
+
     if ((m = FindMethod(gpuiBuffNodeClass, "_OnBuffEnhanceChanged", 1)))
       Hook(m, "GpuiEnhance", (void *)hkGpuiEnhance, (void **)&oGpuiEnhance);
     Log("[OK] GPUIBuffNode._OnBuffEnhanceChanged hooked: %p", m);
@@ -2010,6 +2186,23 @@ DWORD WINAPI MainThread(LPVOID) {
         break;
       }
     }
+
+    if (g_orderedListOffset == 0) {
+      const char *orderedNames[] = {
+        "m_orderedBuffCellList", "_orderedBuffCellList"
+      };
+      int off = FindFieldInHierarchy(buffNodeClass, orderedNames, 2);
+      if (off >= 0) g_orderedListOffset = (size_t)off;
+    }
+
+    const char *stackNames[] = {"m_stackBuffsDict", "_stackBuffsDict"};
+    int stackOff = FindFieldInHierarchy(buffNodeClass, stackNames, 2);
+    if (stackOff >= 0) g_uiStackBuffsOffset = (size_t)stackOff;
+    if (g_uiStackBuffsOffset > 0)
+      Log("[OK] UIBuffNode.m_stackBuffsDict offset: 0x%X",
+          (int)g_uiStackBuffsOffset);
+    else
+      Log("[WARN] UIBuffNode stack dictionary not found, using legacy offset 0xA0");
   }
 
   // Hook GPUIBuffNode stack methods for independent-instance stacking

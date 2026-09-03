@@ -72,6 +72,7 @@ static int g_offSkill_type = -1;        // Skill.<skillType>k__BackingField
 static int g_offHpBar_fadeCtrl = -1;    // MainCharHpBar fade controller (resolved at runtime)
 static int g_offFade_cg = -1;           // FadeCtrl -> CanvasGroup (resolved at runtime)
 static int g_offHpBar_buffNode = -1;    // MainCharHpBar.buffNode (resolved at runtime)
+static int g_offHpBar_gpuiBuffNode = -1; // MainCharHpBar.gpuiBuffNode (resolved at runtime)
 
 // ============================================================================
 // SEH-safe memory read helpers
